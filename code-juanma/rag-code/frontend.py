@@ -47,7 +47,7 @@ def chat_response_ui(message, history, selected_files):
     if not message: return ""
     if not selected_files: return "Please select at least one file from the left panel."
 
-    payload = {"message": message, "selected_files": selected_files, "chat_history": history}
+    payload = {"message": message, "selected_files": selected_files}
     
     try:
         response = requests.post(f"{API_URL}/chat", json=payload)

@@ -59,7 +59,7 @@ vectorstore = Chroma(
 processed_files = set()
 LAST_RETRIEVED_DOCS = []
 
-# --- Pydantic models ---
+# --- Pydantic model ---
 class ChatRequest(BaseModel):
     message: str
     selected_files: List[str]
@@ -67,21 +67,38 @@ class ChatRequest(BaseModel):
 
 
 def reciprocal_rank_fusion(results: list[list], k=60):
+    """RRF implementation to fuse results from multiple queries. Each result is a list of documents sorted by relevance."""
     fused_scores = {}
-    for docs in results:
-        # Assumes the docs are returned in sorted order of relevance
-        for rank, doc in enumerate(docs):
-            doc_str = dumps(doc)
-            if doc_str not in fused_scores:
-                fused_scores[doc_str] = 0
-            previous_score = fused_scores[doc_str]
-            fused_scores[doc_str] += 1 / (rank + k)
+    doc_lookup = {}
 
-    reranked_results = [
-        (loads(doc), score)
-        for doc, score in sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+    for docs in results:
+
+        for rank, doc in enumerate(docs):
+
+            source = doc.metadata.get("source", "unknown")
+            chunk = doc.metadata.get("chunk_index", -1)
+
+            # Unique ID
+            doc_id = f"{source}_chunk_{chunk}"
+
+            if doc_id not in fused_scores:
+                fused_scores[doc_id] = 0.0
+                doc_lookup[doc_id] = doc
+
+            fused_scores[doc_id] += 1.0 / (rank + k)
+
+    # Sort by fused score
+    reranked = sorted(
+        fused_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    # Return unique docuements with their fused scores
+    return [
+        (doc_lookup[doc_id], score)
+        for doc_id, score in reranked
     ]
-    return reranked_results
 
 
 # --- 2. Endpoints ---
@@ -139,6 +156,7 @@ async def process_files(files: List[UploadFile] = File(...)):
             custom_chunker = HybridChunker(
                 tokenizer="BAAI/bge-m3",
                 max_tokens=600,
+                overlap_tokens=200,
                 merge_peers=True         # Merge chunks that are close together to preserve context
             )
 
@@ -200,20 +218,29 @@ async def chat_response(request: ChatRequest):
     print(f"\n--- Starting RAG-Fusion for: '{request.message}' ---")
 
     # --- 1. Multi-Query Generation ---
-    mq_template = """You are an artificial intelligence assistant. Your task is to generate 5 different versions of the user's question for searching in a document database.
-    Return ONLY the generated questions, separated by line breaks, without numbering or extra text.
+    mq_template = """
+        You are an AI assistant. Generate 5 different versions of the given 
+        user question to retrieve relevant documents from a vector database.
 
-    Chat history:
-    {chat_history}
+        By generating multiple perspectives, help overcome limitations of 
+        distance-based similarity search.
 
-    Original question: {question}"""
+        Chat history:
+        {chat_history}
+
+        User question:
+        {question}
+
+        Output only the alternative questions, one per line.
+
+    """
     
     prompt_mq = PromptTemplate.from_template(mq_template)
     mq_chain = prompt_mq | llm | StrOutputParser()
     
     generated_queries_str = mq_chain.invoke({
         "question": request.message, 
-        "chat_history": history_str
+        "chat_history": ""
     })
 
     queries = [request.message] + [q.strip() for q in generated_queries_str.split('\n') if q.strip()]
@@ -221,7 +248,7 @@ async def chat_response(request: ChatRequest):
 
     # --- 2. Parallel recovery ---
     retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 7, "filter": {"source": {"$in": request.selected_files}}}
+        search_kwargs={"k": 3, "filter": {"source": {"$in": request.selected_files}}}
     )
     
     all_retrieved_results = []
@@ -230,7 +257,7 @@ async def chat_response(request: ChatRequest):
 
     # --- 3. Reciprocal Rank Fusion (RRF) ---
     fused_docs = reciprocal_rank_fusion(all_retrieved_results)
-    final_top_docs = [doc for doc, score in fused_docs[:7]]
+    final_top_docs = [doc for doc, score in fused_docs[:6]]
     LAST_RETRIEVED_DOCS = final_top_docs
 
     print(f"Fusion completed. {len(final_top_docs)} unique chunks selected for the response.\n")
